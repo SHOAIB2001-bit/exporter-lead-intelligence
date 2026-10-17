@@ -2,9 +2,12 @@ import os
 import re
 import sqlite3
 import unicodedata
+import ipaddress
+import socket
+from html import unescape
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, urljoin, quote_plus
 
 import pandas as pd
 import requests
@@ -231,6 +234,127 @@ def candidate_from_result(item, industry):
         "notes": "Discovered by web search. Verify company identity, Maharashtra location, product, export capacity and contact details.",
     }
 
+def _is_public_http_url(url):
+    """Allow public HTTP(S) websites only; block localhost/private IP targets."""
+    try:
+        parsed = urlparse(str(url).strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower()
+        if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_global
+        except ValueError:
+            # DNS is resolved by requests; reject obvious internal-only hostnames.
+            return "." in host and not host.endswith((".internal", ".lan"))
+    except Exception:
+        return False
+
+def _visible_text(html):
+    html = re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", html or " ")
+    html = re.sub(r"(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr)>", "\n", html)
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", html))).strip()
+
+def extract_public_contacts(start_url):
+    """Extract business contact details from a company website and likely contact pages."""
+    start_url = str(start_url or "").strip()
+    if not start_url:
+        return {"website": "", "phone": "", "email": "", "company_name": "", "source_url": "", "export_evidence": "", "notes": "No website supplied."}
+    if not re.match(r"^https?://", start_url, re.I):
+        start_url = "https://" + start_url
+    if not _is_public_http_url(start_url):
+        return {"website": start_url, "phone": "", "email": "", "company_name": "", "source_url": start_url, "export_evidence": "", "notes": "Skipped: enter a public company website using HTTP or HTTPS."}
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "ExporterLeadResearch/1.0 (public business contact research; respectful rate limits)"})
+    root = start_url
+    visited = []
+    pages = []
+    errors = []
+    try:
+        response = session.get(start_url, timeout=12, allow_redirects=True)
+        response.raise_for_status()
+        if not _is_public_http_url(response.url):
+            raise ValueError("Website redirected to a non-public URL; skipped for safety.")
+        root = response.url
+        if "text/html" not in response.headers.get("content-type", "text/html").lower():
+            raise ValueError("URL did not return an HTML webpage.")
+        pages.append((root, response.text[:1_500_000]))
+        visited.append(root)
+        # Follow a small number of likely contact/about pages on the same host only.
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(response.text, "html.parser")
+        root_host = urlparse(root).netloc.lower().removeprefix("www.")
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            label = " ".join(a.get_text(" ", strip=True).lower().split())
+            href = urljoin(root, a["href"])
+            parsed = urlparse(href)
+            if parsed.scheme not in ("http", "https") or parsed.netloc.lower().removeprefix("www.") != root_host:
+                continue
+            clue = (label + " " + parsed.path.lower()).lower()
+            if any(k in clue for k in ("contact", "about", "enquiry", "inquiry", "reach-us", "get-in-touch")):
+                clean_url = parsed._replace(fragment="").geturl()
+                if clean_url not in candidates and clean_url not in visited:
+                    candidates.append(clean_url)
+        for url in candidates[:3]:
+            if not _is_public_http_url(url):
+                continue
+            try:
+                r = session.get(url, timeout=10, allow_redirects=True)
+                r.raise_for_status()
+                if _is_public_http_url(r.url) and "text/html" in r.headers.get("content-type", "text/html").lower():
+                    pages.append((r.url, r.text[:1_000_000]))
+                    visited.append(r.url)
+            except Exception as exc:
+                errors.append(f"{url}: {str(exc)[:100]}")
+    except Exception as exc:
+        return {"website": root, "phone": "", "email": "", "company_name": "", "source_url": start_url, "export_evidence": "", "notes": f"Could not fetch website: {str(exc)[:240]}"}
+
+    emails, phones, names, evidence = [], [], [], []
+    email_re = re.compile(r"(?i)(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])")
+    phone_re = re.compile(r"(?<!\w)(?:\+?\s?91[\s().-]*)?(?:\(?0\d{2,4}\)?[\s.-]*)?(?:\d[\s().-]?){7,12}\d(?!\w)")
+    for page_url, html in pages:
+        # mailto/tel links catch cases obscured in visible text.
+        for value in re.findall(r"(?i)mailto:([^\"'?#\s]+)", html):
+            value = value.strip().lower()
+            if email_re.fullmatch(value): emails.append(value)
+        for value in re.findall(r"(?i)tel:([^\"'?#]+)", html):
+            value = re.sub(r"[^+\d]", "", value)
+            if len(re.sub(r"\D", "", value)) >= 8: phones.append(value)
+        text = _visible_text(html)
+        emails.extend(m.group(0).lower() for m in email_re.finditer(text))
+        for match in phone_re.finditer(text):
+            raw = match.group(0).strip()
+            digits = re.sub(r"\D", "", raw)
+            if 8 <= len(digits) <= 13:
+                phones.append(raw)
+        soup = BeautifulSoup(html, "html.parser")
+        if page_url == root:
+            title = soup.title.get_text(" ", strip=True) if soup.title else ""
+            if title: names.append(title[:180])
+            for meta in soup.find_all("meta"):
+                if (meta.get("name", "").lower() == "description" or meta.get("property", "").lower() == "og:description") and meta.get("content"):
+                    names.append(meta["content"].strip()[:300])
+        if re.search(r"(?i)\b(exporter|exports|exporting|export to|international markets|global markets|shipping worldwide)\b", text):
+            evidence.append(page_url)
+    # Filter common false-positive/example emails and dedupe.
+    bad_email_domains = ("example.com", "domain.com", "email.com", "wixpress.com", "sentry.io")
+    emails = [e for e in emails if not any(e.endswith("@" + d) for d in bad_email_domains)]
+    emails = list(dict.fromkeys(emails))
+    phones = list(dict.fromkeys(phones))
+    return {
+        "website": f"{urlparse(root).scheme}://{urlparse(root).netloc}",
+        "phone": " / ".join(phones[:5]),
+        "email": " / ".join(emails[:5]),
+        "company_name": (names[0].split("|")[0].split("-")[0].strip() if names else urlparse(root).netloc),
+        "source_url": " | ".join(visited),
+        "export_evidence": ("Export-related wording found on: " + "; ".join(evidence) if evidence else "No export-related wording detected on checked pages; export status unverified."),
+        "notes": (f"Checked {len(visited)} public page(s). Contact details are extracted from public pages and need verification." + (" Fetch issues: " + "; ".join(errors[:2]) if errors else ""))
+    }
+
 def import_frame(df):
     df = df.copy()
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
@@ -356,6 +480,50 @@ elif page == "Free Lead Finder":
                 st.rerun()
         except Exception as exc:
             st.error(f"Could not read this CSV: {exc}")
+
+    st.markdown("### Extract published phone numbers and emails from company websites")
+    st.write("Paste official company website URLs, one per line. The app checks each homepage and up to three same-domain contact/about pages, then prepares a CSV. It does not guarantee every site exposes a phone or email.")
+    website_list = st.text_area("Company website URLs", placeholder="https://company-one.in\nhttps://company-two.com", height=120, key="contact_extractor_urls")
+    max_sites = st.slider("Maximum websites to check per run", min_value=1, max_value=15, value=5, key="contact_extractor_limit")
+    if st.button("Extract public business contacts", key="run_contact_extractor"):
+        urls = [u.strip() for u in website_list.splitlines() if u.strip()]
+        urls = urls[:max_sites]
+        if not urls:
+            st.warning("Paste at least one official company website URL first.")
+        else:
+            extracted = []
+            progress = st.progress(0)
+            status = st.empty()
+            for idx, url in enumerate(urls, start=1):
+                status.write(f"Checking {idx} of {len(urls)}: {url}")
+                info = extract_public_contacts(url)
+                info["state"] = "Maharashtra"
+                info["city"] = ""
+                info["product_category"] = chosen_sector
+                info["business_type"] = "Manufacturer/exporter candidate"
+                info["contact_name"] = ""
+                info["contact_role"] = ""
+                info["expansion_signal"] = ""
+                info["alibaba_status"] = "Unknown"
+                info["product_fit"] = 0
+                info["export_readiness"] = 0
+                info["expansion_score"] = 0
+                info["alibaba_opportunity"] = 0
+                info["contact_quality"] = 35 if info.get("phone") or info.get("email") else 0
+                info["call_status"] = "Needs research"
+                info["last_contacted"] = ""
+                info["next_action_date"] = ""
+                info["company_name"] = info.get("company_name") or urlparse(url if url.startswith("http") else "https://" + url).netloc
+                extracted.append(info)
+                progress.progress(idx / len(urls))
+            status.write("Extraction complete. Review the results before saving.")
+            extracted_df = pd.DataFrame(extracted)
+            st.dataframe(extracted_df[[c for c in ["company_name", "website", "phone", "email", "export_evidence", "source_url", "notes"] if c in extracted_df.columns]], use_container_width=True, hide_index=True)
+            st.download_button("Download extracted contacts CSV", extracted_df.to_csv(index=False).encode("utf-8"), "extracted_exporter_contacts.csv", "text/csv", key="download_extracted_contacts")
+            if st.button("Save extracted companies to lead database", key="save_extracted_contacts"):
+                imported, skipped = import_frame(extracted_df)
+                st.success(f"Saved/updated {imported} records. Skipped {skipped} records. Check source URLs and verify export status before calling.")
+                st.rerun()
 
 elif page == "Discover Leads":
     st.subheader("Discover candidate companies")
