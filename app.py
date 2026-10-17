@@ -4,7 +4,7 @@ import sqlite3
 import unicodedata
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import pandas as pd
 import requests
@@ -260,7 +260,7 @@ brave_configured = bool(secret("BRAVE_SEARCH_API_KEY"))
 with st.sidebar:
     st.header("Workspace")
     page = st.radio("Navigate", [
-        "Morning Calling List", "Discover Leads", "All Leads",
+        "Morning Calling List", "Free Lead Finder", "Discover Leads", "All Leads",
         "Add a Lead", "Import CSV", "Scoring Guide", "Setup & Status"
     ])
     st.divider()
@@ -293,6 +293,69 @@ if page == "Morning Calling List":
         st.dataframe(due[show_cols], use_container_width=True, hide_index=True)
         st.download_button("Download calling list CSV", due[show_cols].to_csv(index=False).encode("utf-8"), "morning_calling_list.csv", "text/csv")
         st.caption("Search-discovered records start with zero scores until reviewed. A score is not proof of buying intent.")
+
+elif page == "Free Lead Finder":
+    st.subheader("Free lead research desk")
+    st.write("Find potential Maharashtra exporters through free public search pages and directories, then import the companies into your lead database. No search API key required.")
+    st.info("This free mode prepares targeted searches; it does not silently scrape search engines. Open results, verify the company, and import only relevant business records. Search results are not proof that a company exports.")
+
+    sectors = {
+        "Engineering and auto parts": ["auto components", "precision engineering", "castings", "CNC machining", "industrial machinery"],
+        "Textiles and garments": ["textile manufacturer", "garment manufacturer", "home textiles", "fabric exporter", "technical textiles"],
+        "Food and spices": ["spices manufacturer", "food processing", "dehydrated food", "agro products", "food exporter"],
+        "Plastics and packaging": ["plastic packaging", "flexible packaging", "plastic moulding", "industrial packaging", "plastic products manufacturer"],
+        "All manufacturing industries": ["manufacturer exporter", "industrial products manufacturer", "B2B manufacturer", "engineering goods", "industrial components"],
+    }
+    cities = ["All Maharashtra", "Mumbai", "Pune", "Nashik", "Thane", "Navi Mumbai", "Kolhapur", "Chhatrapati Sambhajinagar", "Nagpur", "Ichalkaranji", "Taloja", "Bhiwandi", "Ranjangaon", "Chakan", "Aurangabad MIDC"]
+    chosen_sector = st.selectbox("Industry", list(sectors.keys()))
+    chosen_city = st.selectbox("City / industrial area", cities)
+    include_export_terms = st.checkbox("Prioritize searches mentioning exporter / exports", value=True)
+
+    search_terms = []
+    for product_term in sectors[chosen_sector]:
+        location = "Maharashtra" if chosen_city == "All Maharashtra" else chosen_city
+        suffix = " exporter exports international markets" if include_export_terms else " manufacturer company contact"
+        search_terms.append(f'{product_term} {location}{suffix}')
+    search_terms.extend([
+        f'site:apeda.gov.in {chosen_city if chosen_city != "All Maharashtra" else "Maharashtra"} exporter directory',
+        f'site:fieo.org {chosen_city if chosen_city != "All Maharashtra" else "Maharashtra"} exporter',
+        f'{chosen_city if chosen_city != "All Maharashtra" else "Maharashtra"} manufacturer exporter contact official website',
+    ])
+
+    st.markdown("### Search links")
+    st.caption("Open a search, inspect the company website, and capture only business contact details published for business enquiries.")
+    for i, term in enumerate(search_terms, start=1):
+        url = "https://www.google.com/search?q=" + quote_plus(term)
+        st.markdown(f"{i}. [{term}]({url})")
+
+    st.download_button(
+        "Download this search plan as CSV",
+        pd.DataFrame({"industry": [chosen_sector] * len(search_terms), "area": [chosen_city] * len(search_terms), "search_query": search_terms, "search_url": ["https://www.google.com/search?q=" + quote_plus(q) for q in search_terms]}).to_csv(index=False).encode("utf-8"),
+        "free_maharashtra_exporter_search_plan.csv", "text/csv"
+    )
+
+    st.markdown("### Free public directories to check")
+    st.markdown("""- [APEDA](https://apeda.gov.in/) for agricultural and processed-food exporters
+- [FIEO](https://www.fieo.org/) for exporter resources and member information
+- [EEPC India](https://www.eepcindia.org/) for engineering exporters
+- [ExportersIndia](https://www.exportersindia.com/) for supplier discovery
+- [IndiaMART](https://www.indiamart.com/) for manufacturers and suppliers (export status must be verified)""")
+
+    st.markdown("### Add verified prospects")
+    st.write("Use the import template to add multiple companies at once. Keep the original source URL so you can verify the record before calling.")
+    template = pd.DataFrame(columns=FIELDS)
+    st.download_button("Download lead import template", template.to_csv(index=False).encode("utf-8"), "exporter_lead_template.csv", "text/csv")
+    upload_free = st.file_uploader("Import a CSV of researched companies", type=["csv"], key="free_finder_csv")
+    if upload_free is not None:
+        try:
+            frame = pd.read_csv(upload_free, dtype=str).fillna("")
+            st.dataframe(frame.head(10), use_container_width=True, hide_index=True)
+            if st.button("Save researched companies", key="save_free_finder_csv"):
+                imported, skipped = import_frame(frame)
+                st.success(f"Saved/updated {imported} records. Skipped {skipped} empty or invalid records.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Could not read this CSV: {exc}")
 
 elif page == "Discover Leads":
     st.subheader("Discover candidate companies")
@@ -461,14 +524,17 @@ elif page == "Scoring Guide":
 
 elif page == "Setup & Status":
     st.subheader("Deployment and integration status")
-    st.write("This app can run locally immediately. For a persistent online app, configure Supabase; for live web discovery, configure Brave Search.")
+    st.write("Free Lead Finder works without a paid API. Brave Search discovery remains optional. For a persistent online app, configure Supabase.")
     st.markdown("""
     **Required for online persistence**
     - `SUPABASE_URL`
     - `SUPABASE_KEY` (use a restricted key appropriate to the app; never commit secrets to GitHub)
 
-    **Optional for web discovery**
+    **Optional for API-based web discovery**
     - `BRAVE_SEARCH_API_KEY`
+
+    **Free alternative**
+    - Open **Free Lead Finder** to generate targeted public-search links and import researched companies without an API key.
 
     Add these under **Streamlit Community Cloud → App → Settings → Secrets**.
     """)
@@ -478,4 +544,4 @@ elif page == "Setup & Status":
     st.warning("Without Supabase, hosted Streamlit storage may reset or not be shared reliably. Do not use local SQLite as the permanent database for the online version.")
 
 st.divider()
-st.caption("MVP v2 • Search results are unverified candidates, not confirmed exporters or proof of buying intent. Respect source terms, privacy requirements, and contact opt-outs.")
+st.caption("MVP v2.1 • Free Lead Finder included • Search results are unverified candidates, not confirmed exporters or proof of buying intent. Respect source terms, privacy requirements, and contact opt-outs.")
