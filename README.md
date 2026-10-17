@@ -88,3 +88,7 @@ Search API pricing, quotas, coverage and terms may change. This integration is o
 - Company and contact data coverage varies by industry and provider.
 - Supabase keys are powerful; keep them server-side and use access controls.
 - Current implementation uses a simple normalized company name for deduplication. Similar names, subsidiaries and legal suffixes can still require human review.
+
+
+## Free public contact extraction (added)
+In **Free Lead Finder**, paste official company website URLs and run **Extract public business contacts**. The app checks the homepage and up to three same-domain contact/about pages for publicly published phone numbers, email addresses, and export-related wording. Review and verify every result before calling. Some websites block automated requests or do not publish contacts, so missing details are expected. This feature does not scrape search-engine result pages and does not bypass access controls.
